@@ -114,17 +114,25 @@ public class FanOutKinesisShardSubscription {
 
     /** Method to allow eager activation of the subscription. */
     public void activateSubscription() {
+        if (startingPosition == null) {
+            LOG.info(
+                    "Shard {} has been completely consumed (shard end). Skipping re-subscription.",
+                    shardId);
+            return;
+        }
         LOG.info(
                 "Activating subscription to shard {} with starting position {} for consumer {}.",
                 shardId,
                 startingPosition,
                 consumerArn);
         if (subscriptionActive.get()) {
-            LOG.warn("Skipping activation of subscription since it is already active.");
+            LOG.warn("Shard {} Skipping activation of subscription since it is already active.",
+                    shardId);
             return;
         }
         if (!activating.compareAndSet(false, true)) {
-            LOG.warn("Skipping activation of subscription since one is already in progress.");
+            LOG.warn("Shard {} Skipping activation of subscription since one is already in progress.",
+                    shardId);
             return;
         }
 
@@ -162,7 +170,21 @@ public class FanOutKinesisShardSubscription {
                         subscriptionTimeout.toMillis(),
                         TimeUnit.MILLISECONDS);
 
-        kinesis.subscribeToShard(consumerArn, shardId, startingPosition, responseHandler);
+        kinesis.subscribeToShard(consumerArn, shardId, startingPosition, responseHandler)
+                .exceptionally(
+                        throwable -> {
+                            cancelTimeoutFuture();
+                            LOG.error(
+                                    "Error subscribing to shard {} with starting position {} for consumer {}.",
+                                    shardId,
+                                    startingPosition,
+                                    consumerArn,
+                                    throwable);
+                            if (activating.compareAndSet(true, false)) {
+                                terminateSubscription(throwable);
+                            }
+                            return null;
+                        });
     }
 
     private void cancelTimeoutFuture() {
@@ -209,6 +231,7 @@ public class FanOutKinesisShardSubscription {
                         shardId,
                         recoverableException.get());
                 shardSubscriber.cancel();
+                // TODO: add backoff for LimitExceededException and ResourceInUseException
                 activateSubscription();
                 return null;
             }
@@ -217,18 +240,7 @@ public class FanOutKinesisShardSubscription {
                     "Subscription encountered unrecoverable exception.", throwable);
         }
 
-        SubscribeToShardEvent event = eventQueue.poll();
-        if (event != null) {
-            return event;
-        }
-
-        if (!subscriptionActive.get()) {
-            LOG.debug(
-                    "Subscription to shard {} for consumer {} is not yet active. Skipping.",
-                    shardId,
-                    consumerArn);
-        }
-        return null;
+        return eventQueue.poll();
     }
 
     /**
@@ -288,8 +300,6 @@ public class FanOutKinesisShardSubscription {
                                 // Update the starting position in case we have to recreate the
                                 // subscription
                                 if (event.continuationSequenceNumber() == null) {
-                                    // shard has ended
-                                    LOG.info("Shard ended {}", shardId);
                                     startingPosition = null;
                                 } else {
                                     startingPosition =
@@ -321,9 +331,7 @@ public class FanOutKinesisShardSubscription {
         public void onComplete() {
             LOG.info("Subscription complete - {} ({})", shardId, consumerArn);
             cancel();
-            if (startingPosition != null) {
-                activateSubscription();
-            }
+            activateSubscription();
         }
     }
 }
