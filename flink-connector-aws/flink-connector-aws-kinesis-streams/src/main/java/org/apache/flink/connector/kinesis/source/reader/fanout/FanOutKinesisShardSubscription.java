@@ -142,18 +142,19 @@ public class FanOutKinesisShardSubscription {
                             .subscriber(() -> subscriber)
                             .onError(
                                     throwable -> {
+                                        LOG.error(
+                                                "Error (OnError) subscribing to shard {} with "
+                                                        + "starting position {} for consumer {} {}.",
+                                                shardId,
+                                                startingPosition,
+                                                consumerArn,
+                                                subscriber,
+                                                throwable);
                                         synchronized (lockObject) {
                                             if (!disposeIfActive(subscriber)) {
                                                 return;
                                             }
                                         }
-                                        LOG.error(
-                                                "Error (OnError) subscribing to shard {} with "
-                                                        + "starting position {} for consumer {}.",
-                                                shardId,
-                                                startingPosition,
-                                                consumerArn,
-                                                throwable);
                                         terminateSubscription(throwable);
                                     })
                             .build();
@@ -162,11 +163,6 @@ public class FanOutKinesisShardSubscription {
             timeoutFuture =
                     TIMEOUT_SCHEDULER.schedule(
                             () -> {
-                                synchronized (lockObject) {
-                                    if (!disposeIfActive(subscriber)) {
-                                        return;
-                                    }
-                                }
                                 String errorMessage =
                                         "Timeout when subscribing to shard "
                                                 + shardId
@@ -174,8 +170,15 @@ public class FanOutKinesisShardSubscription {
                                                 + startingPosition
                                                 + " for consumer "
                                                 + consumerArn
+                                                + " for sub "
+                                                + subscriber
                                                 + ".";
                                 LOG.error(errorMessage);
+                                synchronized (lockObject) {
+                                    if (!disposeIfActive(subscriber)) {
+                                        return;
+                                    }
+                                }
                                 terminateSubscription(new TimeoutException(errorMessage));
                             },
                             subscriptionTimeout.toMillis(),
@@ -184,17 +187,18 @@ public class FanOutKinesisShardSubscription {
             kinesis.subscribeToShard(consumerArn, shardId, startingPosition, responseHandler)
                     .exceptionally(
                             throwable -> {
+                                LOG.error(
+                                        "Error subscribing to shard {} with starting position {} for consumer {}. {}",
+                                        shardId,
+                                        startingPosition,
+                                        consumerArn,
+                                        subscriber,
+                                        throwable);
                                 synchronized (lockObject) {
                                     if (!disposeIfActive(subscriber)) {
                                         return null;
                                     }
                                 }
-                                LOG.error(
-                                        "Error subscribing to shard {} with starting position {} for consumer {}.",
-                                        shardId,
-                                        startingPosition,
-                                        consumerArn,
-                                        throwable);
                                 terminateSubscription(throwable);
                                 return null;
                             });
@@ -260,7 +264,7 @@ public class FanOutKinesisShardSubscription {
                 activateSubscription();
                 return null;
             }
-            LOG.error("Subscription encountered unrecoverable exception.", throwable);
+            LOG.error("Subscription encountered unrecoverable exception. {}", shardId, throwable);
             throw new KinesisStreamsSourceException(
                     "Subscription encountered unrecoverable exception.", throwable);
         }
