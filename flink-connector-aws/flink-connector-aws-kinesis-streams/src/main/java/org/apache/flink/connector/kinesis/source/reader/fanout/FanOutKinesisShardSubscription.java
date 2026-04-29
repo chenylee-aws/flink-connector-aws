@@ -147,6 +147,13 @@ public class FanOutKinesisShardSubscription {
                                                 return;
                                             }
                                         }
+                                        LOG.error(
+                                                "Error (OnError) subscribing to shard {} with "
+                                                        + "starting position {} for consumer {}.",
+                                                shardId,
+                                                startingPosition,
+                                                consumerArn,
+                                                throwable);
                                         terminateSubscription(throwable);
                                     })
                             .build();
