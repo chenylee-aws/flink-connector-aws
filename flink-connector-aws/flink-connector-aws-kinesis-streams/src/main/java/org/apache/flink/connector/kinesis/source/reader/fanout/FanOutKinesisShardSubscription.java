@@ -345,11 +345,12 @@ public class FanOutKinesisShardSubscription {
 
         @Override
         public void onError(Throwable throwable) {
-            if (!subscriptionException.compareAndSet(null, throwable)) {
-                LOG.warn(
-                        "Another subscription exception has been queued, ignoring subsequent exceptions",
-                        throwable);
+            synchronized (lockObject) {
+                if (!disposeIfActive(FanOutShardSubscriber.this)) {
+                    return;
+                }
             }
+            terminateSubscription(throwable);
         }
 
         @Override
