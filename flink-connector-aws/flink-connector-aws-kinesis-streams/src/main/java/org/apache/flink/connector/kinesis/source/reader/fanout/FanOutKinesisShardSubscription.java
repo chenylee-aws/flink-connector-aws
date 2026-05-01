@@ -110,9 +110,7 @@ public class FanOutKinesisShardSubscription {
         this.subscriptionTimeout = subscriptionTimeout;
     }
 
-    /**
-     * Method to allow eager activation of the subscription.
-     */
+    /** Method to allow eager activation of the subscription. */
     public void activateSubscription() {
         synchronized (lockObject) {
             if (startingPosition == null) {
@@ -239,7 +237,7 @@ public class FanOutKinesisShardSubscription {
      * during the subscription process.
      *
      * @return next FanOut subscription event containing records. Returns null if subscription is
-     * not yet active and fetching should be retried at a later time.
+     *     not yet active and fetching should be retried at a later time.
      */
     public SubscribeToShardEvent nextEvent() {
         Throwable throwable = subscriptionException.getAndSet(null);
@@ -299,7 +297,9 @@ public class FanOutKinesisShardSubscription {
                         startingPosition,
                         consumerArn);
                 if (shardSubscriber != this) {
-                    // Another path (timeout/error) already won — cancel this subscription
+                    // Timeout/error disposed this subscriber and a new one was created before SDK
+                    // called onSubscribe
+                    // TODO: test this path
                     subscription.cancel();
                     return;
                 }
@@ -345,11 +345,12 @@ public class FanOutKinesisShardSubscription {
 
         @Override
         public void onError(Throwable throwable) {
-            if (!subscriptionException.compareAndSet(null, throwable)) {
-                LOG.warn(
-                        "Another subscription exception has been queued, ignoring subsequent exceptions",
-                        throwable);
+            synchronized (lockObject) {
+                if (!disposeIfActive(FanOutShardSubscriber.this)) {
+                    return;
+                }
             }
+            terminateSubscription(throwable);
         }
 
         @Override
