@@ -70,6 +70,14 @@ public class FanOutKinesisShardSubscription {
                     TimeoutException.class,
                     IOException.class,
                     LimitExceededException.class);
+    private static final ScheduledExecutorService TIMEOUT_SCHEDULER =
+            new ScheduledThreadPoolExecutor(
+                    1,
+                    r -> {
+                        Thread t = new Thread(r, "subscription-timeout-scheduler");
+                        t.setDaemon(true);
+                        return t;
+                    });
 
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
@@ -80,14 +88,6 @@ public class FanOutKinesisShardSubscription {
     // record batches available on next read.
     private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
-    private static final ScheduledExecutorService TIMEOUT_SCHEDULER =
-            new ScheduledThreadPoolExecutor(
-                    1,
-                    r -> {
-                        Thread t = new Thread(r, "subscription-timeout-scheduler");
-                        t.setDaemon(true);
-                        return t;
-                    });
 
     // All fields below are guarded by lockObject
     private final Object lockObject = new Object();
@@ -153,7 +153,7 @@ public class FanOutKinesisShardSubscription {
                                                 return;
                                             }
                                         }
-                                        terminateSubscription(throwable);
+                                        setSubscriptionException(throwable);
                                     })
                             .build();
 
@@ -173,11 +173,17 @@ public class FanOutKinesisShardSubscription {
                                                 + ".";
                                 LOG.error(errorMessage);
                                 synchronized (lockObject) {
+                                    // The timeout future was cancelled between firing and
+                                    // acquiring the lock (e.g. onSubscribe succeeded, or another
+                                    // error path disposed the subscriber). Do nothing.
+                                    if (timeoutFuture == null) {
+                                        return;
+                                    }
                                     if (!disposeIfActive(subscriber)) {
                                         return;
                                     }
                                 }
-                                terminateSubscription(new TimeoutException(errorMessage));
+                                setSubscriptionException(new TimeoutException(errorMessage));
                             },
                             subscriptionTimeout.toMillis(),
                             TimeUnit.MILLISECONDS);
@@ -197,7 +203,7 @@ public class FanOutKinesisShardSubscription {
                                         return null;
                                     }
                                 }
-                                terminateSubscription(throwable);
+                                setSubscriptionException(throwable);
                                 return null;
                             });
         }
@@ -222,7 +228,7 @@ public class FanOutKinesisShardSubscription {
         return true;
     }
 
-    private void terminateSubscription(Throwable t) {
+    private void setSubscriptionException(Throwable t) {
         if (!subscriptionException.compareAndSet(null, t)) {
             LOG.warn(
                     "Another subscription exception has been queued for shardId {}, ignoring subsequent exceptions",
@@ -299,7 +305,6 @@ public class FanOutKinesisShardSubscription {
                 if (shardSubscriber != this) {
                     // Timeout/error disposed this subscriber and a new one was created before SDK
                     // called onSubscribe
-                    // TODO: test this path
                     subscription.cancel();
                     return;
                 }
@@ -346,11 +351,11 @@ public class FanOutKinesisShardSubscription {
         @Override
         public void onError(Throwable throwable) {
             synchronized (lockObject) {
-                if (!disposeIfActive(FanOutShardSubscriber.this)) {
+                if (!disposeIfActive(this)) {
                     return;
                 }
             }
-            terminateSubscription(throwable);
+            setSubscriptionException(throwable);
         }
 
         @Override
