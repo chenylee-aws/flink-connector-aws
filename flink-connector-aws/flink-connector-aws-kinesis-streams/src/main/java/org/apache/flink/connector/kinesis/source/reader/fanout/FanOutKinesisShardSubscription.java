@@ -44,12 +44,12 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -70,11 +70,18 @@ public class FanOutKinesisShardSubscription {
                     TimeoutException.class,
                     IOException.class,
                     LimitExceededException.class);
+    private static final ScheduledExecutorService TIMEOUT_SCHEDULER =
+            new ScheduledThreadPoolExecutor(
+                    1,
+                    r -> {
+                        Thread t = new Thread(r, "subscription-timeout-scheduler");
+                        t.setDaemon(true);
+                        return t;
+                    });
 
     private final AsyncStreamProxy kinesis;
     private final String consumerArn;
     private final String shardId;
-
     private final Duration subscriptionTimeout;
 
     // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
@@ -82,10 +89,13 @@ public class FanOutKinesisShardSubscription {
     private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
-    // Store the current starting position for this subscription. Will be updated each time new
-    // batch of records is consumed
-    private StartingPosition startingPosition;
+    // All fields below are guarded by lockObject
+    private final Object lockObject = new Object();
+    private ScheduledFuture<?> timeoutFuture;
     private FanOutShardSubscriber shardSubscriber;
+
+    // Written by onNext (Netty thread), read by activateSubscription (Data Fetcher thread)
+    private volatile StartingPosition startingPosition;
 
     public FanOutKinesisShardSubscription(
             AsyncStreamProxy kinesis,
@@ -102,100 +112,129 @@ public class FanOutKinesisShardSubscription {
 
     /** Method to allow eager activation of the subscription. */
     public void activateSubscription() {
-        LOG.info(
-                "Activating subscription to shard {} with starting position {} for consumer {}.",
-                shardId,
-                startingPosition,
-                consumerArn);
-        if (shardSubscriber != null
-                && shardSubscriber.getSubscriptionState() == SubscriptionState.SUBSCRIBED) {
-            LOG.warn("Skipping activation of subscription since it is already active.");
-            return;
-        }
+        synchronized (lockObject) {
+            if (startingPosition == null) {
+                LOG.info(
+                        "Shard {} has been completely consumed (shard end). Skipping re-subscription.",
+                        shardId);
+                return;
+            }
+            if (shardSubscriber != null) {
+                LOG.warn(
+                        "Shard {} Skipping activation of subscription since one is already active or in progress.",
+                        shardId);
+                return;
+            }
 
-        // We have to use our own CountDownLatch to wait for subscription to be acquired because
-        // subscription event is tracked via the handler.
-        CountDownLatch waitForSubscriptionLatch = new CountDownLatch(1);
-        shardSubscriber = new FanOutShardSubscriber(waitForSubscriptionLatch);
-        SubscribeToShardResponseHandler responseHandler =
-                SubscribeToShardResponseHandler.builder()
-                        .subscriber(() -> shardSubscriber)
-                        .onError(
-                                throwable -> {
-                                    // Errors that occur when obtaining a subscription are thrown
-                                    // here.
-                                    // After subscription is acquired, these errors can be ignored.
-                                    if (waitForSubscriptionLatch.getCount() > 0) {
-                                        terminateSubscription(throwable);
-                                        waitForSubscriptionLatch.countDown();
+            LOG.info(
+                    "Activating subscription to shard {} with starting position {} for consumer {}.",
+                    shardId,
+                    startingPosition,
+                    consumerArn);
+
+            FanOutShardSubscriber subscriber = new FanOutShardSubscriber();
+            shardSubscriber = subscriber;
+
+            SubscribeToShardResponseHandler responseHandler =
+                    SubscribeToShardResponseHandler.builder()
+                            .subscriber(() -> subscriber)
+                            .onError(
+                                    throwable -> {
+                                        LOG.error(
+                                                "Error (OnError) subscribing to shard {} with "
+                                                        + "starting position {} for consumer {} {}.",
+                                                shardId,
+                                                startingPosition,
+                                                consumerArn,
+                                                subscriber,
+                                                throwable);
+                                        synchronized (lockObject) {
+                                            if (!disposeIfActive(subscriber)) {
+                                                return;
+                                            }
+                                        }
+                                        setSubscriptionException(throwable);
+                                    })
+                            .build();
+
+            cancelTimeoutFuture();
+            timeoutFuture =
+                    TIMEOUT_SCHEDULER.schedule(
+                            () -> {
+                                String errorMessage =
+                                        "Timeout when subscribing to shard "
+                                                + shardId
+                                                + " with starting position "
+                                                + startingPosition
+                                                + " for consumer "
+                                                + consumerArn
+                                                + " for sub "
+                                                + subscriber
+                                                + ".";
+                                LOG.error(errorMessage);
+                                synchronized (lockObject) {
+                                    // The timeout future was cancelled between firing and
+                                    // acquiring the lock (e.g. onSubscribe succeeded, or another
+                                    // error path disposed the subscriber). Do nothing.
+                                    if (timeoutFuture == null) {
+                                        return;
                                     }
-                                })
-                        .build();
+                                    if (!disposeIfActive(subscriber)) {
+                                        return;
+                                    }
+                                }
+                                setSubscriptionException(new TimeoutException(errorMessage));
+                            },
+                            subscriptionTimeout.toMillis(),
+                            TimeUnit.MILLISECONDS);
 
-        // We don't need to keep track of the future here because we monitor subscription success
-        // using our own CountDownLatch
-        kinesis.subscribeToShard(consumerArn, shardId, startingPosition, responseHandler)
-                .exceptionally(
-                        throwable -> {
-                            // If consumer exists and is still activating, we want to countdown.
-                            if (ExceptionUtils.findThrowable(
-                                            throwable, ResourceInUseException.class)
-                                    .isPresent()) {
-                                waitForSubscriptionLatch.countDown();
+            kinesis.subscribeToShard(consumerArn, shardId, startingPosition, responseHandler)
+                    .exceptionally(
+                            throwable -> {
+                                LOG.error(
+                                        "Error subscribing to shard {} with starting position {} for consumer {}. {}",
+                                        shardId,
+                                        startingPosition,
+                                        consumerArn,
+                                        subscriber,
+                                        throwable);
+                                synchronized (lockObject) {
+                                    if (!disposeIfActive(subscriber)) {
+                                        return null;
+                                    }
+                                }
+                                setSubscriptionException(throwable);
                                 return null;
-                            }
-                            LOG.error(
-                                    "Error subscribing to shard {} with starting position {} for consumer {}.",
-                                    shardId,
-                                    startingPosition,
-                                    consumerArn,
-                                    throwable);
-                            terminateSubscription(throwable);
-                            return null;
-                        });
-
-        // We have to handle timeout for subscriptions separately because Java 8 does not support a
-        // fluent orTimeout() methods on CompletableFuture.
-        CompletableFuture.runAsync(
-                () -> {
-                    try {
-                        if (waitForSubscriptionLatch.await(
-                                subscriptionTimeout.toMillis(), TimeUnit.MILLISECONDS)) {
-                            LOG.info(
-                                    "Successfully subscribed to shard {} with starting position {} for consumer {}.",
-                                    shardId,
-                                    startingPosition,
-                                    consumerArn);
-                            // Request first batch of records.
-                            shardSubscriber.requestRecords();
-
-                        } else {
-                            String errorMessage =
-                                    "Timeout when subscribing to shard "
-                                            + shardId
-                                            + " with starting position "
-                                            + startingPosition
-                                            + " for consumer "
-                                            + consumerArn
-                                            + ".";
-                            LOG.error(errorMessage);
-                            terminateSubscription(new TimeoutException(errorMessage));
-                        }
-                    } catch (InterruptedException e) {
-                        LOG.warn("Interrupted while waiting for subscription to complete.", e);
-                        terminateSubscription(e);
-                        Thread.currentThread().interrupt();
-                    }
-                });
+                            });
+        }
     }
 
-    private void terminateSubscription(Throwable t) {
+    // Must be called while holding lockObject
+    private void cancelTimeoutFuture() {
+        if (timeoutFuture != null) {
+            timeoutFuture.cancel(false);
+            timeoutFuture = null;
+        }
+    }
+
+    // Must be called while holding lockObject
+    private boolean disposeIfActive(FanOutShardSubscriber subscriber) {
+        if (shardSubscriber != subscriber) {
+            return false;
+        }
+        cancelTimeoutFuture();
+        shardSubscriber.cancelSubscription();
+        shardSubscriber = null;
+        return true;
+    }
+
+    private void setSubscriptionException(Throwable t) {
         if (!subscriptionException.compareAndSet(null, t)) {
             LOG.warn(
-                    "Another subscription exception has been queued, ignoring subsequent exceptions",
+                    "Another subscription exception has been queued for shardId {}, ignoring subsequent exceptions",
+                    shardId,
                     t);
         }
-        shardSubscriber.cancel();
     }
 
     /**
@@ -209,10 +248,6 @@ public class FanOutKinesisShardSubscription {
     public SubscribeToShardEvent nextEvent() {
         Throwable throwable = subscriptionException.getAndSet(null);
         if (throwable != null) {
-            // If consumer is still activating, we want to wait.
-            if (ExceptionUtils.findThrowable(throwable, ResourceInUseException.class).isPresent()) {
-                return null;
-            }
             // We don't want to wrap ResourceNotFoundExceptions because it is handled via a
             // try-catch loop
             if (throwable instanceof ResourceNotFoundException) {
@@ -226,47 +261,19 @@ public class FanOutKinesisShardSubscription {
                             .findFirst();
             if (recoverableException.isPresent()) {
                 LOG.warn(
-                        "Recoverable exception encountered while subscribing to shard. Ignoring.",
+                        "Recoverable exception encountered for shard {} while subscribing to shard. Ignoring: {}",
+                        shardId,
                         recoverableException.get());
-                shardSubscriber.cancel();
+                // TODO: add backoff for LimitExceededException and ResourceInUseException
                 activateSubscription();
                 return null;
             }
-            LOG.error("Subscription encountered unrecoverable exception.", throwable);
+            LOG.error("Subscription encountered unrecoverable exception. {}", shardId, throwable);
             throw new KinesisStreamsSourceException(
                     "Subscription encountered unrecoverable exception.", throwable);
         }
-        final SubscriptionState state =
-                Optional.ofNullable(shardSubscriber)
-                        .map(FanOutShardSubscriber::getSubscriptionState)
-                        .orElse(SubscriptionState.NOT_STARTED);
 
-        switch (state) {
-            case NOT_STARTED:
-                LOG.debug(
-                        "Subscription to shard {} for consumer {} is not yet active. Skipping.",
-                        shardId,
-                        consumerArn);
-                return null;
-            case COMPLETED:
-                if (shardSubscriber.isShardEndReached()) {
-                    LOG.info(
-                            "Subscription reached SHARD_END for shard {} for consumer {}.",
-                            shardId,
-                            consumerArn);
-                    return null;
-                }
-                LOG.info(
-                        "Subscription expired to shard {} for consumer {}. Restarting.",
-                        shardId,
-                        consumerArn);
-                activateSubscription();
-                return null;
-            case SUBSCRIBED:
-                return eventQueue.poll();
-            default:
-                throw new IllegalStateException("Unknown subscription state: " + state);
-        }
+        return eventQueue.poll();
     }
 
     /**
@@ -274,61 +281,37 @@ public class FanOutKinesisShardSubscription {
      * Streams.
      */
     private class FanOutShardSubscriber implements Subscriber<SubscribeToShardEventStream> {
-        private final CountDownLatch subscriptionLatch;
+
         private Subscription subscription;
-
-        private final AtomicReference<SubscriptionState> subscriptionState =
-                new AtomicReference<>(SubscriptionState.NOT_STARTED);
-        private final AtomicBoolean isShardEnd = new AtomicBoolean(false);
-
-        private FanOutShardSubscriber(CountDownLatch subscriptionLatch) {
-            this.subscriptionLatch = subscriptionLatch;
-        }
-
-        /**
-         * Fetch the state that the subscriber is in.
-         *
-         * @return Subscription state for the subscriber.
-         */
-        public SubscriptionState getSubscriptionState() {
-            return subscriptionState.get();
-        }
-
-        /**
-         * Boolean whether this subscriber has reached the end of a shard.
-         *
-         * @return True if ShardEnd. false otherwise.
-         */
-        public boolean isShardEndReached() {
-            return isShardEnd.get();
-        }
 
         public void requestRecords() {
             subscription.request(1);
         }
 
-        public void cancel() {
-            if (this.subscriptionState.get() == SubscriptionState.COMPLETED) {
-                LOG.warn("Trying to cancel inactive subscription. Ignoring.");
-                return;
-            }
-
+        public void cancelSubscription() {
             if (subscription != null) {
                 subscription.cancel();
             }
-            this.subscriptionState.set(SubscriptionState.COMPLETED);
         }
 
         @Override
         public void onSubscribe(Subscription subscription) {
-            LOG.info(
-                    "Successfully subscribed to shard {} at {} using consumer {}.",
-                    shardId,
-                    startingPosition,
-                    consumerArn);
-            this.subscription = subscription;
-            this.subscriptionState.set(SubscriptionState.SUBSCRIBED);
-            subscriptionLatch.countDown();
+            synchronized (lockObject) {
+                LOG.info(
+                        "Successfully subscribed to shard {} at {} using consumer {}.",
+                        shardId,
+                        startingPosition,
+                        consumerArn);
+                if (shardSubscriber != this) {
+                    // Timeout/error disposed this subscriber and a new one was created before SDK
+                    // called onSubscribe
+                    subscription.cancel();
+                    return;
+                }
+                cancelTimeoutFuture();
+                this.subscription = subscription;
+                requestRecords();
+            }
         }
 
         @Override
@@ -344,17 +327,15 @@ public class FanOutKinesisShardSubscription {
                                         event);
                                 eventQueue.put(event);
 
-                                if (event.continuationSequenceNumber() == null) {
-                                    isShardEnd.set(true);
-                                    return;
-                                }
-
                                 // Update the starting position in case we have to recreate the
                                 // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
-                                                event.continuationSequenceNumber());
-
+                                if (event.continuationSequenceNumber() == null) {
+                                    startingPosition = null;
+                                } else {
+                                    startingPosition =
+                                            StartingPosition.continueFromSequenceNumber(
+                                                    event.continuationSequenceNumber());
+                                }
                                 // Replace the record just consumed in the Queue
                                 requestRecords();
                             } catch (InterruptedException e) {
@@ -369,24 +350,21 @@ public class FanOutKinesisShardSubscription {
 
         @Override
         public void onError(Throwable throwable) {
-            if (!subscriptionException.compareAndSet(null, throwable)) {
-                LOG.warn(
-                        "Another subscription exception has been queued, ignoring subsequent exceptions",
-                        throwable);
+            synchronized (lockObject) {
+                if (!disposeIfActive(this)) {
+                    return;
+                }
             }
+            setSubscriptionException(throwable);
         }
 
         @Override
         public void onComplete() {
-            LOG.info("Subscription complete - {} ({})", shardId, consumerArn);
-            this.subscriptionState.set(SubscriptionState.COMPLETED);
+            synchronized (lockObject) {
+                LOG.info("Subscription complete - {} ({})", shardId, consumerArn);
+                shardSubscriber = null;
+            }
+            activateSubscription();
         }
-    }
-
-    /** States that the {@code FanOutShardSubscriber} may be in. */
-    private enum SubscriptionState {
-        NOT_STARTED,
-        SUBSCRIBED,
-        COMPLETED
     }
 }
