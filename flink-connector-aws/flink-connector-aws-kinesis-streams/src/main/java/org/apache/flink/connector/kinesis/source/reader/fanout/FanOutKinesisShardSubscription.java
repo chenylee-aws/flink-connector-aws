@@ -93,6 +93,7 @@ public class FanOutKinesisShardSubscription {
     private final Object lockObject = new Object();
     private ScheduledFuture<?> timeoutFuture;
     private FanOutShardSubscriber shardSubscriber;
+    private boolean closed = false;
 
     // Written by onNext (Netty thread), read by activateSubscription (Data Fetcher thread)
     private volatile StartingPosition startingPosition;
@@ -113,6 +114,12 @@ public class FanOutKinesisShardSubscription {
     /** Method to allow eager activation of the subscription. */
     public void activateSubscription() {
         synchronized (lockObject) {
+            if (closed) {
+                LOG.debug(
+                        "Subscription for shard {} is closed; skipping activation.",
+                        shardId);
+                return;
+            }
             if (startingPosition == null) {
                 LOG.info(
                         "Shard {} has been completely consumed (shard end). Skipping re-subscription.",
@@ -141,7 +148,7 @@ public class FanOutKinesisShardSubscription {
                             .onError(
                                     throwable -> {
                                         LOG.error(
-                                                "Error (OnError) subscribing to shard {} with "
+                                                "Error onError subscribing to shard {} with "
                                                         + "starting position {} for consumer {} {}.",
                                                 shardId,
                                                 startingPosition,
@@ -192,7 +199,8 @@ public class FanOutKinesisShardSubscription {
                     .exceptionally(
                             throwable -> {
                                 LOG.error(
-                                        "Error subscribing to shard {} with starting position {} for consumer {}. {}",
+                                        "Error exceptionally subscribing to shard {} with starting position {} for "
+                                                + "consumer {}. {}",
                                         shardId,
                                         startingPosition,
                                         consumerArn,
@@ -273,7 +281,37 @@ public class FanOutKinesisShardSubscription {
                     "Subscription encountered unrecoverable exception.", throwable);
         }
 
-        return eventQueue.poll();
+        return pollAndRequestNext();
+    }
+
+    /**
+     * Poll the next buffered event and, if one was available, request the next event from the
+     * server. This implements pull-based backpressure: the server is only asked for another event
+     * once the consumer has made room in the queue, so the Netty event loop thread handling
+     * {@code onNext} never needs to block.
+     *
+     * <p>Both the {@code poll()} and the {@code requestRecords()} must happen atomically under
+     * {@code lockObject} with respect to {@code onSubscribe}. Otherwise the following race can
+     * inflate pipeline depth beyond 1: (1) the consumer polls the leftover event outside the
+     * lock, emptying the queue; (2) {@code onSubscribe} acquires the lock first, observes
+     * {@code eventQueue.isEmpty() == true}, and issues its priming {@code request(1)};
+     * (3) the consumer then acquires the lock and issues a second {@code request(1)}. Holding
+     * the lock across both the poll and the request closes this window: either the consumer
+     * drains+requests atomically (and {@code onSubscribe} later sees empty queue, skips its
+     * request because by then {@code pollAndRequestNext} already requested), or
+     * {@code onSubscribe} sees the non-empty queue and skips its request, leaving the request
+     * to the subsequent consumer drain.
+     */
+    private SubscribeToShardEvent pollAndRequestNext() {
+        synchronized (lockObject) {
+            SubscribeToShardEvent event = eventQueue.poll();
+            // if shardSubscriber it means that it either completed or disposed. In both case don't
+            // request more record
+            if (event != null && shardSubscriber != null) {
+                shardSubscriber.requestRecords();
+            }
+            return event;
+        }
     }
 
     /**
@@ -285,7 +323,12 @@ public class FanOutKinesisShardSubscription {
         private Subscription subscription;
 
         public void requestRecords() {
-            subscription.request(1);
+            // subscription can be null if onSubscribe has not yet fired on a freshly activated
+            // subscriber. In that case the initial request(1) will be issued from onSubscribe
+            // itself, so it is safe to skip here.
+            if (subscription != null) {
+                subscription.request(1);
+            }
         }
 
         public void cancelSubscription() {
@@ -310,7 +353,26 @@ public class FanOutKinesisShardSubscription {
                 }
                 cancelTimeoutFuture();
                 this.subscription = subscription;
-                requestRecords();
+
+                // Only issue the initial request(1) if the queue is empty. If this is a
+                // reactivation after an error while leftover events from the previous
+                // subscription are still buffered, we MUST NOT prime the pump here, otherwise
+                // the pipeline depth would inflate: this request plus the request that
+                // pollAndRequestNext() will issue when the consumer drains a leftover event
+                // would both be outstanding, so the server could deliver more events than the
+                // queue can hold. Skipping the request here is safe because the consumer's next
+                // successful poll of a leftover event will trigger requestRecords() via
+                // pollAndRequestNext(), which will issue the request(1) at that point.
+                if (eventQueue.isEmpty()) {
+                    requestRecords();
+                } else {
+                    LOG.debug(
+                            "Shard {} reactivated with {} buffered event(s). Deferring initial "
+                                    + "request(1) to the consumer-drain path to preserve the "
+                                    + "max-one-in-flight invariant.",
+                            shardId,
+                            eventQueue.size());
+                }
             }
         }
 
@@ -320,15 +382,73 @@ public class FanOutKinesisShardSubscription {
                     new SubscribeToShardResponseHandler.Visitor() {
                         @Override
                         public void visit(SubscribeToShardEvent event) {
-                            try {
+                            // Critical section: identity check, queue offer, and
+                            // startingPosition update must all be atomic with respect to
+                            // disposeIfActive()/activateSubscription() so that:
+                            //   (1) we do not accept events from a subscriber that has already
+                            //       been disposed (the AWS SDK can deliver onNext briefly after
+                            //       subscription.cancel() until the cancel is honored on the
+                            //       network side), and
+                            //   (2) an in-progress offer is never observed by a newly activated
+                            //       subscriber as an unexpected queue entry.
+                            // Accepted events always belong to the currently active subscriber.
+                            // Events from disposed subscribers are silently dropped; they will
+                            // be re-delivered by the server when the replacement subscription
+                            // resumes from the last confirmed startingPosition, so no data is
+                            // lost (at-least-once semantics preserved).
+                            synchronized (lockObject) {
+                                if (shardSubscriber != FanOutShardSubscriber.this) {
+                                    LOG.warn(
+                                            "Ignoring late event for shard {} from a disposed "
+                                                    + "subscriber; it will be re-delivered after "
+                                                    + "reactivation.",
+                                            shardId);
+                                    return;
+                                }
+
                                 LOG.debug(
                                         "Received event: {}, {}",
                                         event.getClass().getSimpleName(),
                                         event);
-                                eventQueue.put(event);
+
+                                // Non-blocking offer. Under the request-one-after-drain
+                                // discipline (onSubscribe requests only when the queue is empty,
+                                // and subsequent request(1) calls come from the consumer drain
+                                // path in nextEvent()), there is at most one event in flight per
+                                // subscriber at any time, so the queue is guaranteed to have
+                                // room. If offer() ever returns false it indicates a protocol /
+                                // state invariant violation (e.g. the server delivered an
+                                // unrequested event) - fail loud rather than block the Netty
+                                // event loop. The subscription will be reactivated from the
+                                // previous startingPosition (which has not yet been advanced
+                                // below) and the server will re-deliver this event.
+                                if (!eventQueue.offer(event)) {
+                                    LOG.error(
+                                            "Event queue overflow for shard {}; server delivered "
+                                                    + "an unrequested event. Failing subscription "
+                                                    + "to recover.",
+                                            shardId);
+                                    // Dispose first, then set the exception only if disposal
+                                    // succeeded (i.e., this subscriber was still the active one).
+                                    // This matches the convention used by onError, the timeout
+                                    // path, and the activateSubscription exceptionally handler,
+                                    // and prevents a stale subscriber from overwriting the
+                                    // subscriptionException slot with a no-longer-relevant error.
+                                    if (disposeIfActive(FanOutShardSubscriber.this)) {
+                                        setSubscriptionException(
+                                                new IOException(
+                                                        "Event queue overflow for shard "
+                                                                + shardId
+                                                                + "; server delivered an "
+                                                                + "unrequested event."));
+                                    }
+                                    return;
+                                }
 
                                 // Update the starting position in case we have to recreate the
-                                // subscription
+                                // subscription. Done only after a successful offer so that an
+                                // overflow triggers a resubscribe from the previous position and
+                                // the rejected event is re-delivered by the server.
                                 if (event.continuationSequenceNumber() == null) {
                                     startingPosition = null;
                                 } else {
@@ -336,13 +456,13 @@ public class FanOutKinesisShardSubscription {
                                             StartingPosition.continueFromSequenceNumber(
                                                     event.continuationSequenceNumber());
                                 }
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new KinesisStreamsSourceException(
-                                        "Interrupted while adding Kinesis record to internal buffer.",
-                                        e);
+
+                                // NOTE: we intentionally do NOT call requestRecords() here. The
+                                // next request(1) is issued from nextEvent() after the consumer
+                                // drains the queue. This implements pull-based backpressure and
+                                // prevents this Netty event-loop thread from blocking, which
+                                // would otherwise stall every other HTTP/2 stream multiplexed
+                                // onto the same channel.
                             }
                         }
                     });
@@ -365,6 +485,15 @@ public class FanOutKinesisShardSubscription {
                 shardSubscriber = null;
             }
             activateSubscription();
+        }
+    }
+
+    public void close() {
+        synchronized (lockObject) {
+            closed = true;
+            if (shardSubscriber != null) {
+                disposeIfActive(shardSubscriber);
+            }
         }
     }
 }
